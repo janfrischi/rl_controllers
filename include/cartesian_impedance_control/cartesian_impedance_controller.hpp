@@ -174,6 +174,7 @@ public:
     Eigen::Matrix<double, 6, 1> error;                                                       // pose error (6d)
     double nullspace_stiffness_{0.001};
     double nullspace_stiffness_target_{0.001};
+    double D_gain = 2.05;
 
     //Logging
     int outcounter = 0;

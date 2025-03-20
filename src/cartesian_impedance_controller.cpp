@@ -248,7 +248,15 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
 /*   switch (mode_)
   {
   case 1: */
+
     Theta = Lambda;
+
+    // correcting D to be critically damped
+    D =  D_gain* K.cwiseMax(0.0).cwiseSqrt() * Lambda.cwiseMax(0.0).diagonal().cwiseSqrt().asDiagonal();
+
+    D.topRightCorner(3,3).setZero();
+    D.bottomLeftCorner(3,3).setZero();
+    
     F_impedance = -1 * (D * (jacobian * dq_) + K * error /*+ I_error*/);
 /*  break;
 
