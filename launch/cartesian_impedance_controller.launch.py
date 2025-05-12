@@ -80,6 +80,10 @@ def generate_launch_description():
             package='controller_manager',
             executable='spawner',
             arguments=['cartesian_impedance_controller'],
+            parameters=[
+                {'free_movement_mode': False},  # Default: Free movement mode disabled
+                {'policy_control_mode': True}  # Default: Policy control mode disabled
+            ],
             output='screen',
-        ),
+        )
     ])

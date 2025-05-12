@@ -59,9 +59,12 @@ pluginlib_export_plugin_description_file(
         controller_interface cartesian_impedance_control.xml)
 
 add_executable(user_input_client src/user_input_client.cpp)
-target_link_libraries(user_input_client ${PROJECT_NAME})
-
-
+target_link_libraries(user_input_client ${PROJECT_NAME}
+  ${rclcpp_LIBRARIES}
+  ${messages_fr3_LIBRARIES}
+  ${franka_msgs_LIBRARIES}
+  ${rclcpp_action_LIBRARIES}
+)
 
 
 install(TARGETS
@@ -84,7 +87,6 @@ install(
   DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
 )
-
 
 if(BUILD_TESTING)
     find_package(ament_cmake_clang_format REQUIRED)

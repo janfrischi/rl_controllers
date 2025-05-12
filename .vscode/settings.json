@@ -1,5 +1,23 @@
 {
     "files.associations": {
         "cassert": "cpp"
-    }
+    },
+    "python.autoComplete.extraPaths": [
+        "/home/pdzuser/franka_ros2_ws/install/zed_pose_estimation/lib/python3.10/site-packages",
+        "/home/pdzuser/franka_ros2_ws/install/messages_fr3/local/lib/python3.10/dist-packages",
+        "/home/pdzuser/franka_ros2_ws/install/franka_rl_bridge/lib/python3.10/site-packages",
+        "/home/pdzuser/franka_ros2_ws/install/franka_gripper/local/lib/python3.10/dist-packages",
+        "/home/pdzuser/franka_ros2_ws/install/franka_msgs/local/lib/python3.10/dist-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/pdzuser/franka_ros2_ws/install/zed_pose_estimation/lib/python3.10/site-packages",
+        "/home/pdzuser/franka_ros2_ws/install/messages_fr3/local/lib/python3.10/dist-packages",
+        "/home/pdzuser/franka_ros2_ws/install/franka_rl_bridge/lib/python3.10/site-packages",
+        "/home/pdzuser/franka_ros2_ws/install/franka_gripper/local/lib/python3.10/dist-packages",
+        "/home/pdzuser/franka_ros2_ws/install/franka_msgs/local/lib/python3.10/dist-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ]
 }

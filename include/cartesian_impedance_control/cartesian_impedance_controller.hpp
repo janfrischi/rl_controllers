@@ -50,6 +50,9 @@
 #include "franka_semantic_components/franka_robot_model.hpp"
 #include "franka_semantic_components/franka_robot_state.hpp"
 
+#include <std_msgs/msg/float64_multi_array.hpp>
+#include <std_msgs/msg/bool.hpp>
+
 #define IDENTITY Eigen::MatrixXd::Identity(6, 6)
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
@@ -80,13 +83,23 @@ public:
 
     void setPose(const std::shared_ptr<messages_fr3::srv::SetPose::Request> request, 
     std::shared_ptr<messages_fr3::srv::SetPose::Response> response);
-      
 
  private:
     //Nodes
     rclcpp::Subscription<franka_msgs::msg::FrankaRobotState>::SharedPtr franka_state_subscriber = nullptr;
     rclcpp::Service<messages_fr3::srv::SetPose>::SharedPtr pose_srv_;
 
+    // Control mode flags
+    bool free_movement_mode_ = false;
+    bool policy_control_mode_ = false;
+
+    // Add policy control related members:
+    rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr policy_outputs_subscription_ = nullptr;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr policy_resumed_publisher_; // Declare the publisher
+    std::array<double, 7> policy_joint_positions_{};
+    bool policy_outputs_received_ = false;
+    bool targets_initialized_ = false;
+    double filter_factor_ = 0.005;
 
     //Functions
     void topic_callback(const std::shared_ptr<franka_msgs::msg::FrankaRobotState> msg);
@@ -105,7 +118,8 @@ public:
     Eigen::Matrix<double, 6, 1> O_F_ext_hat_K_M = Eigen::MatrixXd::Zero(6,1);
     Eigen::Matrix<double, 7, 1> q_;
     Eigen::Matrix<double, 7, 1> dq_;
-    Eigen::MatrixXd jacobian_transpose_pinv;  
+    Eigen::MatrixXd jacobian_transpose_pinv;
+    Eigen::Matrix<double, 7, 1> filtered_targets_ = Eigen::Matrix<double, 7, 1>::Zero();
 
     //Robot parameters
     const int num_joints = 7;
@@ -199,5 +213,8 @@ public:
     //Filter-parameters
     double filter_params_{0.001};
     int mode_ = 1;
+
+    // Add policy callback:
+    void policy_outputs_callback(const std::shared_ptr<std_msgs::msg::Float64MultiArray> msg);
 };
 }  // namespace cartesian_impedance_control
