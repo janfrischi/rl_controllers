@@ -354,7 +354,7 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
     // Apply filtering to smooth target transitions
     double max_delta = 0.1;  // [rad] ~1.72 degrees
     
-    // Calculate the filtered target positions
+    // Calculate the filtered target positions, policy_joint_positions_ is the target from the policy
     for (size_t i = 0; i < 7; ++i) {
       // Calculate the delta between policy output and filtered target, policy_joint_positions_ is the target from the policy and filtered_targets_ is the previous target
       double delta = policy_joint_positions_[i] - filtered_targets_(i);
@@ -495,7 +495,9 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
   tau_d = saturateTorqueRate(tau_d, tau_J_d_M);
   tau_J_d_M = tau_d;
 
-  // Send joint torque commands to the robot via the command interfaces
+  // Send joint torque commands to the robot via the command interfaces, command_interfaces_ are hardware interfaces 
+  // Each interface maps to a joint torque command eg. /panda_joint1/effort
+  // Calling .set_value() on each command interface sets the desired torque for that joint
   for (size_t i = 0; i < 7; ++i) {
     command_interfaces_[i].set_value(tau_d(i));
   }
