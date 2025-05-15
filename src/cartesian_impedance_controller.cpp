@@ -432,7 +432,7 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
 
     // Print debug information
     if (outcounter % 100 == 0) {
-        RCLCPP_INFO(get_node()->get_logger(), "==== Free Movement Mode with Reduced Damping ====");
+        RCLCPP_INFO(get_node()->get_logger(), "==== Free Movement Mode with Damping ====");
         RCLCPP_INFO(get_node()->get_logger(), "Gravity Compensation Torques: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
               coriolis(0), coriolis(1), coriolis(2), coriolis(3), coriolis(4), coriolis(5), coriolis(6));
         RCLCPP_INFO(get_node()->get_logger(), "Damping Torques: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
