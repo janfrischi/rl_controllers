@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <cartesian_impedance_control/cartesian_impedance_controller.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 
 #include <cassert>
 #include <cmath>
@@ -43,6 +44,11 @@ using std::placeholders::_1;
 // Add a new member variable for free movement mode
 bool free_movement_mode_ = false;
 bool policy_control_mode_ = false;
+
+// Add a new member variable for trajectory playback
+bool trajectory_playback_mode_ = false;
+std::array<double, 7> playback_joint_positions_;
+bool playback_positions_received_ = false;
 
 void CartesianImpedanceController::update_stiffness_and_references(){
   //target by filtering
@@ -142,8 +148,11 @@ CallbackReturn CartesianImpedanceController::on_configure(const rclcpp_lifecycle
   // Ensure that the free_movement_moded can be set via launch file or dynamically via ros2 param set
   free_movement_mode_ = get_node()->declare_parameter<bool>("free_movement_mode", false);
   policy_control_mode_ = get_node()->declare_parameter<bool>("policy_control_mode", false);
+  trajectory_playback_mode_ = get_node()->declare_parameter<bool>("trajectory_playback_mode", false);
 
   RCLCPP_INFO(get_node()->get_logger(), "Free movement mode parameter: %s", free_movement_mode_ ? "ON" : "OFF");
+  RCLCPP_INFO(get_node()->get_logger(), "Trajectory Playback Mode parameter: %s", trajectory_playback_mode_ ? "ON" : "OFF");
+  RCLCPP_INFO(get_node()->get_logger(), "Policy Control Mode parameter: %s", policy_control_mode_ ? "ON" : "OFF");
 
   franka_robot_model_ = std::make_unique<franka_semantic_components::FrankaRobotModel>(
   franka_semantic_components::FrankaRobotModel(robot_name_ + "/" + k_robot_model_interface_name,
@@ -176,6 +185,22 @@ CallbackReturn CartesianImpedanceController::on_configure(const rclcpp_lifecycle
   } catch (const std::exception& e) {
     RCLCPP_ERROR(get_node()->get_logger(), 
       "Exception thrown during policy outputs subscription creation: %s", e.what());
+    return CallbackReturn::ERROR;
+  }
+
+  try {
+    // Subscribe to the /trajectory_playback/joint_positions topic
+    rclcpp::QoS qos_profile(10);  // Buffer size of 10
+    qos_profile.reliability(RMW_QOS_POLICY_RELIABILITY_RELIABLE);
+
+    trajectory_playback_subscription_ = get_node()->create_subscription<std_msgs::msg::Float64MultiArray>(
+        "/trajectory_playback/joint_positions", qos_profile,
+        std::bind(&CartesianImpedanceController::trajectory_playback_callback, this, std::placeholders::_1));
+
+    RCLCPP_INFO(get_node()->get_logger(), "Successfully subscribed to /trajectory_playback/joint_positions");
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "Exception thrown during trajectory playback subscription creation: %s", e.what());
     return CallbackReturn::ERROR;
   }
 
@@ -250,6 +275,24 @@ void CartesianImpedanceController::policy_outputs_callback(
   
 }
 
+void CartesianImpedanceController::trajectory_playback_callback(
+    const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
+    // Check if the message has exactly 7 joint positions
+    if (msg->data.size() != 7) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Invalid trajectory playback message: Expected 7 joint values, got %zu", msg->data.size());
+        return;
+    }
+
+    // Store the joint positions in the playback_joint_positions_ array
+    for (size_t i = 0; i < 7; ++i) {
+        playback_joint_positions_[i] = msg->data[i];
+    }
+
+    // Set flag that we've received playback positions
+    playback_positions_received_ = true;
+}
+
 void CartesianImpedanceController::updateJointStates() {
   for (auto i = 0; i < num_joints; ++i) {
     const auto& position_interface = state_interfaces_.at(2 * i);
@@ -268,16 +311,10 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
 
   // Get the current value of the free_movement_mode parameter
   get_node()->get_parameter("free_movement_mode", free_movement_mode_);
-  // Get the current value of the policy_control_mode parameter (if you want it to be dynamic too)
+  // Get the current value of the policy_control_mode parameter
   get_node()->get_parameter("policy_control_mode", policy_control_mode_);
-
-  // Optional: Re-evaluate precedence if both can be changed dynamically
-  if (free_movement_mode_ && policy_control_mode_) {
-    RCLCPP_WARN_ONCE(get_node()->get_logger(), // Log only once to avoid spamming
-                "Both free_movement_mode and policy_control_mode are set to true. "
-                "Free movement mode will take precedence.");
-    // policy_control_mode_ = false; // Decide if you want to force policy_control_mode_ off here
-  }
+  // Get the current value of the trajectory_playback_mode parameter
+  get_node()->get_parameter("trajectory_playback_mode", trajectory_playback_mode_);
 
   // Get robot state data from franka_robot_model
   std::array<double, 49> mass = franka_robot_model_->getMassMatrix();
@@ -304,21 +341,105 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
   // Initialize torque vector
   Eigen::VectorXd tau_d(7);
 
+
+  // -------------------------------------TRAJECTORY PLAYBACK MODE------------------------------------------------
+  if (trajectory_playback_mode_) {
+    // Log that we are in trajectory playback mode
+    RCLCPP_INFO(get_node()->get_logger(), "Trajectory Playback Mode is ON");
+    if (!playback_positions_received_) {
+        RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 1000,
+                             "Waiting for trajectory playback positions...");
+        return controller_interface::return_type::OK;
+    }
+
+    // Convert playback_joint_positions_ to Eigen format
+    Eigen::Matrix<double, 7, 1> q_desired_raw;
+    for (size_t i = 0; i < 7; ++i) {
+        q_desired_raw(i) = playback_joint_positions_[i];
+    }
+
+    // Initialize filtered targets on first run
+    if (!targets_initialized_) {
+        filtered_targets_ = q_;  // Start from the current joint positions
+        targets_initialized_ = true;
+    }
+
+    // Apply clamping and filtering to smooth target transitions
+    double max_delta = 0.1;  // [rad] ~1.72 degrees
+    double alpha = 0.005;      // Smoothing factor for filtering
+    for (size_t i = 0; i < 7; ++i) {
+        // Calculate the delta between the raw desired position and the filtered target
+        double delta = q_desired_raw(i) - filtered_targets_(i);
+
+        // Clamp the delta to the maximum allowable range
+        delta = std::clamp(delta, -max_delta, max_delta);
+
+        // Update the filtered target with the clamped delta and apply smoothing
+        filtered_targets_(i) = alpha * (filtered_targets_(i) + delta) + (1.0 - alpha) * filtered_targets_(i);
+    }
+
+    // Set the desired joint position (always use the latest filtered_targets_)
+    Eigen::Matrix<double, 7, 1> q_desired = filtered_targets_;
+
+    // Compute joint position error
+    Eigen::Matrix<double, 7, 1> position_error = q_desired - q_;
+
+    // Define stiffness (kp) and damping (kd) gains
+    Eigen::Matrix<double, 7, 1> kp;
+    Eigen::Matrix<double, 7, 1> kd;
+
+    kp << 400, 400, 400, 300, 60, 40, 10;  // Joint-specific stiffness
+    for (size_t i = 0; i < 7; ++i) {
+        kd(i) = 2.5 * std::sqrt(kp(i));  // Critical damping
+    }
+
+    // Calculate joint torques using PD control law with gravity compensation
+    tau_d = kp.cwiseProduct(position_error) - kd.cwiseProduct(dq_) + coriolis;
+
+    // Debug output for trajectory playback mode
+    if (outcounter % 100 == 0) {
+        RCLCPP_INFO(get_node()->get_logger(), "==== Trajectory Playback Mode ====");
+        RCLCPP_INFO(get_node()->get_logger(), "Raw Desired Positions: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+                    q_desired_raw(0), q_desired_raw(1), q_desired_raw(2), q_desired_raw(3),
+                    q_desired_raw(4), q_desired_raw(5), q_desired_raw(6));
+        RCLCPP_INFO(get_node()->get_logger(), "Filtered Desired Positions: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+                    q_desired(0), q_desired(1), q_desired(2), q_desired(3),
+                    q_desired(4), q_desired(5), q_desired(6));
+        RCLCPP_INFO(get_node()->get_logger(), "Current Positions: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+                    q_(0), q_(1), q_(2), q_(3), q_(4), q_(5), q_(6));
+        RCLCPP_INFO(get_node()->get_logger(), "Position Error: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+                    position_error(0), position_error(1), position_error(2), position_error(3),
+                    position_error(4), position_error(5), position_error(6));
+        RCLCPP_INFO(get_node()->get_logger(), "==========================");
+    }
+  }
+
+
   // --------------------------------------------------FREE MOVEMENT MODE-------------------------------------------------------------------------------
-  if (free_movement_mode_) {
+  else if (free_movement_mode_) {
     // Apply gravity compensation torques
     Eigen::Map<Eigen::Matrix<double, 7, 1>> coriolis(coriolis_array.data());
+    Eigen::Matrix<double, 7, 1> damping_torque;
+    double damping_coefficient = 0.05;  // Default damping coefficient for all joints
+
+    // Reduce damping for all joints
     for (size_t i = 0; i < 7; ++i) {
-        command_interfaces_[i].set_value(coriolis[i]);  // Send gravity compensation torques
+        damping_torque(i) = -damping_coefficient * dq_(i);  // Default damping for all joints
     }
+
+    // Calculate joint torques using gravity compensation and reduced damping
+    tau_d = damping_torque + coriolis;
+
     // Print debug information
-    if (outcounter % 1 == 0) {  // Log every 100 iterations
-      RCLCPP_INFO(get_node()->get_logger(), "==== Free Movement Mode ====");
-      RCLCPP_INFO(get_node()->get_logger(), "Gravity Compensation Torques: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
-            coriolis(0), coriolis(1), coriolis(2), coriolis(3), coriolis(4), coriolis(5), coriolis(6));
-      RCLCPP_INFO(get_node()->get_logger(), "==========================");
+    if (outcounter % 100 == 0) {
+        RCLCPP_INFO(get_node()->get_logger(), "==== Free Movement Mode with Reduced Damping ====");
+        RCLCPP_INFO(get_node()->get_logger(), "Gravity Compensation Torques: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+              coriolis(0), coriolis(1), coriolis(2), coriolis(3), coriolis(4), coriolis(5), coriolis(6));
+        RCLCPP_INFO(get_node()->get_logger(), "Damping Torques: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+              damping_torque(0), damping_torque(1), damping_torque(2), damping_torque(3),
+              damping_torque(4), damping_torque(5), damping_torque(6));
+        RCLCPP_INFO(get_node()->get_logger(), "==========================");
     }
-    return controller_interface::return_type::OK;
   }
 
   // --------------------------------------------------POLICY CONTROL MODE-------------------------------------------------------------------------------
@@ -339,7 +460,7 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
 
     // Calculate damping using the critically damped formula: kd = 2*sqrt(kp)
     for (size_t i = 0; i < 7; ++i) {
-      kd(i) = 2 * std::sqrt(kp(i));   // Critical damping for smoother motion
+      kd(i) = 2.5 * std::sqrt(kp(i));   // Critical damping for smoother motion
     }
 
     // Create target position vector from policy outputs with filtering
@@ -408,8 +529,6 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
 
       RCLCPP_INFO(get_node()->get_logger(), "==========================");
     }
-    return controller_interface::return_type::OK;
-
   } 
 
   // -------------------------------------------ORIGINAL CARTESIAN IMPEDANCE CONTROL MODE---------------------------------------------------------
@@ -471,22 +590,19 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
     tau_d = tau_impedance + tau_nullspace + coriolis;
 
     // Debug output for cartesian control mode
-    if (outcounter % 10 == 0) {  // Log every 10 iterations
-      std::cout << "F_ext_robot [N]" << std::endl;
-      std::cout << O_F_ext_hat_K << std::endl;
-      std::cout << O_F_ext_hat_K_M << std::endl;
-      std::cout << "Lambda  Theta.inv(): " << std::endl;
-      std::cout << Lambda * Theta.inverse() << std::endl;
-      std::cout << "tau_d" << std::endl;
-      std::cout << tau_d << std::endl;
-      std::cout << "--------" << std::endl;
-      std::cout << tau_nullspace << std::endl;
-      std::cout << "--------" << std::endl;
-      std::cout << tau_impedance << std::endl;
-      std::cout << "--------" << std::endl;
-      std::cout << coriolis << std::endl;
-      std::cout << "Inertia scaling [m]: " << std::endl;
-      std::cout << T << std::endl;
+    if (outcounter % 100 == 0) {  // Log every 10 iterations
+        RCLCPP_INFO(get_node()->get_logger(), "\n==== Cartesian Impedance Control Mode ====");
+        
+        // Log external forces
+        RCLCPP_INFO(get_node()->get_logger(), "External Forces [N]: [Fx: %.3f, Fy: %.3f, Fz: %.3f, Tx: %.3f, Ty: %.3f, Tz: %.3f]",
+                    O_F_ext_hat_K[0], O_F_ext_hat_K[1], O_F_ext_hat_K[2],
+                    O_F_ext_hat_K[3], O_F_ext_hat_K[4], O_F_ext_hat_K[5]);
+
+        // Log computed torques
+        RCLCPP_INFO(get_node()->get_logger(), "Computed Torques [Nm]: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+                    tau_d(0), tau_d(1), tau_d(2), tau_d(3), tau_d(4), tau_d(5), tau_d(6));
+
+        RCLCPP_INFO(get_node()->get_logger(), "====================================================");
     }
   }
   // -------------------------------------------------------------------------------------------
@@ -498,6 +614,7 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
   // Send joint torque commands to the robot via the command interfaces, command_interfaces_ are hardware interfaces 
   // Each interface maps to a joint torque command eg. /panda_joint1/effort
   // Calling .set_value() on each command interface sets the desired torque for that joint
+  
   for (size_t i = 0; i < 7; ++i) {
     command_interfaces_[i].set_value(tau_d(i));
   }
@@ -506,9 +623,7 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
   update_stiffness_and_references();
   return controller_interface::return_type::OK;
 }
-}
-
-// namespace cartesian_impedance_control
+} // namespace cartesian_impedance_control
 #include "pluginlib/class_list_macros.hpp"
 // NOLINTNEXTLINE
 PLUGINLIB_EXPORT_CLASS(cartesian_impedance_control::CartesianImpedanceController,

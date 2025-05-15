@@ -101,8 +101,15 @@ public:
     bool targets_initialized_ = false;
     double filter_factor_ = 0.005;
 
+    // Add a new member variable for trajectory playback
+    bool trajectory_playback_mode_ = false;  // Flag to enable trajectory playback mode
+    std::array<double, 7> playback_joint_positions_;  // Stores the joint positions received from the trajectory playback node
+    bool playback_positions_received_ = false;  // Flag to indicate if playback positions have been received
+    rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr trajectory_playback_subscription_ = nullptr;
+
     //Functions
     void topic_callback(const std::shared_ptr<franka_msgs::msg::FrankaRobotState> msg);
+    void trajectory_playback_callback(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
     void updateJointStates();
     void update_stiffness_and_references();
     void arrayToMatrix(const std::array<double, 6>& inputArray, Eigen::Matrix<double, 6, 1>& resultMatrix);
