@@ -82,7 +82,9 @@ def generate_launch_description():
             arguments=['cartesian_impedance_controller'],
             parameters=[
                 {'free_movement_mode': False},  # Default: Free movement mode disabled
-                {'policy_control_mode': True}  # Default: Policy control mode disabled
+                {'policy_control_mode': True},  # Default: Policy control mode disabled
+                {'reset_to_default_position': False}  # Default: Reset to default position disabled
+                
             ],
             output='screen',
         )

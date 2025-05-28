@@ -92,6 +92,7 @@ public:
     // Control mode flags
     bool free_movement_mode_ = false;
     bool policy_control_mode_ = false;
+    bool reset_to_default_position_ = false; // Flag to trigger reset action
 
     // Add policy control related members:
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr policy_outputs_subscription_ = nullptr;

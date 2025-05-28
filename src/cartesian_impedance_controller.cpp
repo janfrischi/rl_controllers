@@ -50,6 +50,9 @@ bool trajectory_playback_mode_ = false;
 std::array<double, 7> playback_joint_positions_;
 bool playback_positions_received_ = false;
 
+// Add a new flag to trigger the reset action
+bool reset_to_default_position_ = false;
+
 void CartesianImpedanceController::update_stiffness_and_references(){
   //target by filtering
   /** at the moment we do not use dynamic reconfigure and control the robot via D, K and T **/
@@ -145,14 +148,17 @@ CallbackReturn CartesianImpedanceController::on_init() {
 
 
 CallbackReturn CartesianImpedanceController::on_configure(const rclcpp_lifecycle::State& /*previous_state*/) {
-  // Ensure that the free_movement_moded can be set via launch file or dynamically via ros2 param set
+  // Ensure that the free_movement_mode can be set via launch file or dynamically via ros2 param set
   free_movement_mode_ = get_node()->declare_parameter<bool>("free_movement_mode", false);
   policy_control_mode_ = get_node()->declare_parameter<bool>("policy_control_mode", false);
   trajectory_playback_mode_ = get_node()->declare_parameter<bool>("trajectory_playback_mode", false);
+  // Declare a parameter to trigger the reset action
+  reset_to_default_position_ = get_node()->declare_parameter<bool>("reset_to_default_position", false);
 
   RCLCPP_INFO(get_node()->get_logger(), "Free movement mode parameter: %s", free_movement_mode_ ? "ON" : "OFF");
   RCLCPP_INFO(get_node()->get_logger(), "Trajectory Playback Mode parameter: %s", trajectory_playback_mode_ ? "ON" : "OFF");
   RCLCPP_INFO(get_node()->get_logger(), "Policy Control Mode parameter: %s", policy_control_mode_ ? "ON" : "OFF");
+  RCLCPP_INFO(get_node()->get_logger(), "Reset to Default Position parameter: %s", reset_to_default_position_ ? "ON" : "OFF");
 
   franka_robot_model_ = std::make_unique<franka_semantic_components::FrankaRobotModel>(
   franka_semantic_components::FrankaRobotModel(robot_name_ + "/" + k_robot_model_interface_name,
@@ -224,8 +230,10 @@ CallbackReturn CartesianImpedanceController::on_activate(
   std::array<double, 16> initial_pose = franka_robot_model_->getPoseMatrix(franka::Frame::kEndEffector);
   Eigen::Affine3d initial_transform(Eigen::Matrix4d::Map(initial_pose.data()));
   position_d_ = initial_transform.translation();
+  position_d_target_ = Eigen::Vector3d(0.453, -0.027, 0.25);
   orientation_d_ = Eigen::Quaterniond(initial_transform.rotation());
-  policy_joint_positions_ = {0.0, -0.569, 0.0, -2.810, 0.0, 3.037, 0.741};
+  orientation_d_target_ = Eigen::Quaterniond(1.0, -0.003, 0.018, -0.008);
+  policy_joint_positions_ = {0.0444, -0.1894, -0.1107, -2.5148, 0.0044, 2.3775, 0.6952};
   std::cout << "Completed Activation process" << std::endl;
   return CallbackReturn::SUCCESS;
 }
@@ -315,6 +323,8 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
   get_node()->get_parameter("policy_control_mode", policy_control_mode_);
   // Get the current value of the trajectory_playback_mode parameter
   get_node()->get_parameter("trajectory_playback_mode", trajectory_playback_mode_);
+  // Get the current value of the reset_to_default_position parameter
+  get_node()->get_parameter("reset_to_default_position", reset_to_default_position_);
 
   // Get robot state data from franka_robot_model
   std::array<double, 49> mass = franka_robot_model_->getMassMatrix();
@@ -417,31 +427,114 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
 
   // --------------------------------------------------FREE MOVEMENT MODE-------------------------------------------------------------------------------
   else if (free_movement_mode_) {
-    // Apply gravity compensation torques
-    Eigen::Map<Eigen::Matrix<double, 7, 1>> coriolis(coriolis_array.data());
-    Eigen::Matrix<double, 7, 1> damping_torque;
-    double damping_coefficient = 0.05;  // Default damping coefficient for all joints
+    if (!reset_to_default_position_) {
+        // Original Free Movement Mode logic: Gravity compensation and damping
+        Eigen::Map<Eigen::Matrix<double, 7, 1>> coriolis(coriolis_array.data());
+        Eigen::Matrix<double, 7, 1> damping_torque;
+        double damping_coefficient = 0.05;
 
-    // Reduce damping for all joints
-    for (size_t i = 0; i < 7; ++i) {
-        damping_torque(i) = -damping_coefficient * dq_(i);  // Default damping for all joints
+        for (size_t i = 0; i < 7; ++i) {
+            damping_torque(i) = -damping_coefficient * dq_(i);
+        }
+
+        tau_d = damping_torque + coriolis;
+
+        // Reset the targets_initialized_ flag to allow re-initialization on the next reset
+        targets_initialized_ = false;
+
+        // Log that we are in free movement mode
+        if (outcounter % 100 == 0) {  // Log every 100 iterations
+          RCLCPP_INFO(get_node()->get_logger(), "==== Free Movement Mode ====");
+          RCLCPP_INFO(get_node()->get_logger(), "Damping Coefficient: %.3f", damping_coefficient);
+
+          // Log current joint velocities
+          RCLCPP_INFO(get_node()->get_logger(), "Current Joint Velocities [rad/s]: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+                      dq_(0), dq_(1), dq_(2), dq_(3), dq_(4), dq_(5), dq_(6));
+
+          // Log damping torques
+          RCLCPP_INFO(get_node()->get_logger(), "Damping Torques [Nm]: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+                      damping_torque(0), damping_torque(1), damping_torque(2),
+                      damping_torque(3), damping_torque(4), damping_torque(5), damping_torque(6));
+
+          // Log coriolis forces
+          RCLCPP_INFO(get_node()->get_logger(), "Coriolis Forces [Nm]: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+                      coriolis(0), coriolis(1), coriolis(2),
+                      coriolis(3), coriolis(4), coriolis(5), coriolis(6));
+
+          RCLCPP_INFO(get_node()->get_logger(), "==========================");
+          }
+    
+    // Resetting to default positions
+    } else if (reset_to_default_position_) {
+        // Reset to default position with clamping and filtering
+        RCLCPP_INFO(get_node()->get_logger(), "Resetting to default position...");
+
+        // Define stiffness (kp) and damping (kd) gains
+        Eigen::Matrix<double, 7, 1> kp;
+        Eigen::Matrix<double, 7, 1> kd;
+
+        kp << 200, 200, 200, 150, 50, 30, 10;  // Reduced stiffness for smoother motion
+        for (size_t i = 0; i < 7; ++i) {
+            kd(i) = 2.0 * std::sqrt(kp(i));  // Critical damping
+        }
+
+        // Convert policy_joint_positions_ (default position) to Eigen format
+        Eigen::Matrix<double, 7, 1> q_desired_raw;
+        for (size_t i = 0; i < 7; ++i) {
+            q_desired_raw(i) = policy_joint_positions_[i];
+        }
+
+        // Initialize filtered targets on first run
+        if (!targets_initialized_) {
+            filtered_targets_ = q_;  // Start from the current joint positions
+            targets_initialized_ = true;
+        }
+
+        // Apply clamping and filtering to smooth target transitions
+        double max_delta = 0.05;  // Maximum allowable change per iteration [rad]
+        double alpha = 0.01;      // Smoothing factor for filtering
+        bool reset_completed = true;  // Track if the reset process is completed
+
+        for (size_t i = 0; i < 7; ++i) {
+            // Calculate the delta between the raw desired position and the filtered target
+            double delta = q_desired_raw(i) - filtered_targets_(i);
+
+            // Clamp the delta to the maximum allowable range
+            delta = std::clamp(delta, -max_delta, max_delta);
+
+            // Update the filtered target with the clamped delta and apply smoothing
+            filtered_targets_(i) = alpha * (filtered_targets_(i) + delta) + (1.0 - alpha) * filtered_targets_(i);
+
+            // Check if the reset process is still ongoing
+            RCLCPP_INFO(get_node()->get_logger(), "Difference for joint %zu: %.3f",
+                        i, std::abs(q_desired_raw(i) - filtered_targets_(i)));
+            if (std::abs(q_desired_raw(i) - filtered_targets_(i)) > 0.07) {
+                reset_completed = false;
+            }
+        }
+
+        // Set the desired joint position (always use the latest filtered_targets_)
+        Eigen::Matrix<double, 7, 1> q_desired = filtered_targets_;
+
+        // Compute joint position error
+        Eigen::Matrix<double, 7, 1> position_error = q_desired - q_;
+
+        // Calculate joint torques using PD control law with gravity compensation
+        tau_d = kp.cwiseProduct(position_error) - kd.cwiseProduct(dq_) + coriolis;
+
+        // If the reset process is completed, reset the flag and switch back to original Free Movement Mode
+        if (reset_completed) {
+            RCLCPP_INFO(get_node()->get_logger(), "Reset to default position completed. Switching back to Free Movement Mode.");
+            
+            // Reset the flag in the controller
+            reset_to_default_position_ = false;
+            targets_initialized_ = false;  // Allow re-initialization for the next reset
+
+            // Update the parameter on the parameter server
+            get_node()->set_parameter(rclcpp::Parameter("reset_to_default_position", false));
+        }
     }
-
-    // Calculate joint torques using gravity compensation and reduced damping
-    tau_d = damping_torque + coriolis;
-
-    // Print debug information
-    if (outcounter % 100 == 0) {
-        RCLCPP_INFO(get_node()->get_logger(), "==== Free Movement Mode with Damping ====");
-        RCLCPP_INFO(get_node()->get_logger(), "Gravity Compensation Torques: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
-              coriolis(0), coriolis(1), coriolis(2), coriolis(3), coriolis(4), coriolis(5), coriolis(6));
-        RCLCPP_INFO(get_node()->get_logger(), "Damping Torques: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
-              damping_torque(0), damping_torque(1), damping_torque(2), damping_torque(3),
-              damping_torque(4), damping_torque(5), damping_torque(6));
-        RCLCPP_INFO(get_node()->get_logger(), "==========================");
-    }
-  }
-
+}
   // --------------------------------------------------POLICY CONTROL MODE-------------------------------------------------------------------------------
   else if (policy_control_mode_) {
     
@@ -449,7 +542,7 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
     Eigen::Matrix<double, 7, 1> kp;
     Eigen::Matrix<double, 7, 1> kd;
 
-    // Set joint-specific gains with the desired stiffness values
+    // Set joint-specific gains with the desired stiffnesss values
     kp(0) = 400;  // Joint 1
     kp(1) = 400;  // Joint 2
     kp(2) = 400;  // Joint 3
