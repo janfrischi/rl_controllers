@@ -52,6 +52,7 @@
 
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 
 #define IDENTITY Eigen::MatrixXd::Identity(6, 6)
 
@@ -107,6 +108,23 @@ public:
     std::array<double, 7> playback_joint_positions_;  // Stores the joint positions received from the trajectory playback node
     bool playback_positions_received_ = false;  // Flag to indicate if playback positions have been received
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr trajectory_playback_subscription_ = nullptr;
+
+    // Imitation Learning mode
+    bool imitation_learning_mode_ = false;
+    bool imitation_commands_received_ = false;
+    Eigen::Vector3d imitation_position_target_{0.5, 0.0, 0.4};  // Default position
+    Eigen::Quaterniond imitation_orientation_target_{1.0, 0.0, 0.0, 0.0};  // Default orientation
+
+    // Add these new filtering variables
+    Eigen::Vector3d filtered_position_target_{0.5, 0.0, 0.4};  // Filtered position target
+    Eigen::Quaterniond filtered_orientation_target_{1.0, 0.0, 0.0, 0.0};  // Filtered orientation target
+    bool imitation_targets_initialized_ = false;  // Flag for initialization
+    double imitation_position_filter_factor_ = 0.05;  // Position filtering factor
+    double imitation_orientation_filter_factor_ = 0.05;  // Orientation filtering factor
+    double max_position_delta_ = 0.01;  // Maximum position change per iteration [m]
+    double max_orientation_delta_ = 0.05;  // Maximum orientation change per iteration [rad]
+
+    rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr imitation_learning_subscription_ = nullptr;
 
     //Functions
     void topic_callback(const std::shared_ptr<franka_msgs::msg::FrankaRobotState> msg);
@@ -224,5 +242,7 @@ public:
 
     // Add policy callback:
     void policy_outputs_callback(const std::shared_ptr<std_msgs::msg::Float64MultiArray> msg);
+    void cartesian_pose_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
+    void imitation_learning_callback(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
 };
 }  // namespace cartesian_impedance_control

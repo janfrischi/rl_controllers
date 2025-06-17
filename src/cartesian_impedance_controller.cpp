@@ -53,6 +53,13 @@ bool playback_positions_received_ = false;
 // Add a new flag to trigger the reset action
 bool reset_to_default_position_ = false;
 
+// Add a new member variable for imitation learning mode
+bool imitation_learning_mode_ = false;
+bool imitation_commands_received_ = false;
+Eigen::Vector3d imitation_position_target_{0.5, 0.0, 0.4};  // Default position
+Eigen::Quaterniond imitation_orientation_target_{1.0, 0.0, 0.0, 0.0};  // Default orientation
+rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr imitation_learning_subscription_ = nullptr;
+
 void CartesianImpedanceController::update_stiffness_and_references(){
   //target by filtering
   /** at the moment we do not use dynamic reconfigure and control the robot via D, K and T **/
@@ -154,11 +161,13 @@ CallbackReturn CartesianImpedanceController::on_configure(const rclcpp_lifecycle
   trajectory_playback_mode_ = get_node()->declare_parameter<bool>("trajectory_playback_mode", false);
   // Declare a parameter to trigger the reset action
   reset_to_default_position_ = get_node()->declare_parameter<bool>("reset_to_default_position", false);
+  imitation_learning_mode_ = get_node()->declare_parameter<bool>("imitation_learning_mode", false);
 
   RCLCPP_INFO(get_node()->get_logger(), "Free movement mode parameter: %s", free_movement_mode_ ? "ON" : "OFF");
   RCLCPP_INFO(get_node()->get_logger(), "Trajectory Playback Mode parameter: %s", trajectory_playback_mode_ ? "ON" : "OFF");
   RCLCPP_INFO(get_node()->get_logger(), "Policy Control Mode parameter: %s", policy_control_mode_ ? "ON" : "OFF");
   RCLCPP_INFO(get_node()->get_logger(), "Reset to Default Position parameter: %s", reset_to_default_position_ ? "ON" : "OFF");
+  RCLCPP_INFO(get_node()->get_logger(), "Imitation Learning Mode parameter: %s", imitation_learning_mode_ ? "ON" : "OFF");
 
   franka_robot_model_ = std::make_unique<franka_semantic_components::FrankaRobotModel>(
   franka_semantic_components::FrankaRobotModel(robot_name_ + "/" + k_robot_model_interface_name,
@@ -208,6 +217,32 @@ CallbackReturn CartesianImpedanceController::on_configure(const rclcpp_lifecycle
     RCLCPP_ERROR(get_node()->get_logger(),
                  "Exception thrown during trajectory playback subscription creation: %s", e.what());
     return CallbackReturn::ERROR;
+  }
+
+  try {
+    // Subscribe to the imitation learning commands topic
+    rclcpp::QoS imitation_qos_profile(10);  // Buffer size of 10
+    imitation_qos_profile.reliability(RMW_QOS_POLICY_RELIABILITY_RELIABLE);
+
+    imitation_learning_subscription_ = get_node()->create_subscription<std_msgs::msg::Float64MultiArray>(
+        "/cartesian_position_controller/commands", imitation_qos_profile,
+        std::bind(&CartesianImpedanceController::imitation_learning_callback, this, std::placeholders::_1));
+
+    RCLCPP_INFO(get_node()->get_logger(), "Successfully subscribed to /cartesian_position_controller/commands");
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "Exception thrown during imitation learning subscription creation: %s", e.what());
+    return CallbackReturn::ERROR;
+  }
+
+  // Add conflict resolution after trajectory playback conflict check
+  if (imitation_learning_mode_ && (free_movement_mode_ || policy_control_mode_ || trajectory_playback_mode_)) {
+    RCLCPP_WARN(get_node()->get_logger(),
+                "Imitation learning mode conflicts with other modes. "
+                "Imitation learning mode will take precedence.");
+    free_movement_mode_ = false;
+    policy_control_mode_ = false;
+    trajectory_playback_mode_ = false;
   }
 
   // Add parameter for policy control mode
@@ -301,6 +336,42 @@ void CartesianImpedanceController::trajectory_playback_callback(
     playback_positions_received_ = true;
 }
 
+void CartesianImpedanceController::imitation_learning_callback(
+    const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
+    // Check if the message has exactly 7 values: [x, y, z, qx, qy, qz, qw]
+    if (msg->data.size() != 7) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Invalid imitation learning command: Expected 7 values [x,y,z,qx,qy,qz,qw], got %zu", msg->data.size());
+        return;
+    }
+
+    // Store RAW targets (these will be filtered in the update loop)
+    imitation_position_target_ = Eigen::Vector3d(msg->data[0], msg->data[1], msg->data[2]);
+    
+    // Convert quaternion from [qx, qy, qz, qw] to Eigen::Quaterniond [w, x, y, z]
+    imitation_orientation_target_ = Eigen::Quaterniond(
+        msg->data[6],  // w
+        msg->data[3],  // x
+        msg->data[4],  // y
+        msg->data[5]   // z
+    );
+    
+    // Normalize quaternion to ensure it's valid
+    imitation_orientation_target_.normalize();
+
+    // Set flag that we've received imitation commands
+    imitation_commands_received_ = true;
+    
+    // Optional: Log received commands for debugging
+    static int log_counter = 0;
+    if (++log_counter % 100 == 0) {  // Log every 100 messages
+        RCLCPP_DEBUG(get_node()->get_logger(),
+                     "Received imitation command - Pos: [%.3f, %.3f, %.3f], Quat: [%.3f, %.3f, %.3f, %.3f]",
+                     imitation_position_target_.x(), imitation_position_target_.y(), imitation_position_target_.z(),
+                     imitation_orientation_target_.w(), imitation_orientation_target_.x(), 
+                     imitation_orientation_target_.y(), imitation_orientation_target_.z());
+    }
+}
 void CartesianImpedanceController::updateJointStates() {
   for (auto i = 0; i < num_joints; ++i) {
     const auto& position_interface = state_interfaces_.at(2 * i);
@@ -325,6 +396,17 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
   get_node()->get_parameter("trajectory_playback_mode", trajectory_playback_mode_);
   // Get the current value of the reset_to_default_position parameter
   get_node()->get_parameter("reset_to_default_position", reset_to_default_position_);
+  get_node()->get_parameter("imitation_learning_mode", imitation_learning_mode_);
+
+  // Check if imitation learning mode just got enabled
+  static bool prev_imitation_learning_mode = false;
+  if (imitation_learning_mode_ && !prev_imitation_learning_mode) {
+    // Mode just switched to imitation learning, reset filtering
+    imitation_targets_initialized_ = false;
+    imitation_commands_received_ = false;
+    RCLCPP_INFO(get_node()->get_logger(), "Switched to imitation learning mode - resetting filters");
+  }
+  prev_imitation_learning_mode = imitation_learning_mode_;
 
   // Get robot state data from franka_robot_model
   std::array<double, 49> mass = franka_robot_model_->getMassMatrix();
@@ -624,6 +706,156 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
     }
   } 
 
+  // --------------------------------------------------IMITATION LEARNING MODE-------------------------------------------------------------------------------
+  else if (imitation_learning_mode_) {
+    
+    if (!imitation_commands_received_) {
+        RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 1000,
+                             "Waiting for imitation learning commands...");
+        return controller_interface::return_type::OK;
+    }
+
+    // Initialize filtered targets on first run
+    if (!imitation_targets_initialized_) {
+        // Initialize with current robot pose
+        std::array<double, 16> initial_pose = franka_robot_model_->getPoseMatrix(franka::Frame::kEndEffector);
+        Eigen::Affine3d current_transform(Eigen::Matrix4d::Map(initial_pose.data()));
+        
+        filtered_position_target_ = current_transform.translation();
+        filtered_orientation_target_ = Eigen::Quaterniond(current_transform.rotation());
+        
+        imitation_targets_initialized_ = true;
+        RCLCPP_INFO(get_node()->get_logger(), "Initialized imitation learning targets from current pose");
+    }
+
+    // Apply position filtering with clamping
+    Eigen::Vector3d position_delta = imitation_position_target_ - filtered_position_target_;
+    
+    // Clamp position delta to maximum allowable change
+    double position_delta_norm = position_delta.norm();
+    if (position_delta_norm > max_position_delta_) {
+        position_delta = position_delta * (max_position_delta_ / position_delta_norm);
+    }
+    
+    // Apply exponential filtering to position
+    filtered_position_target_ += imitation_position_filter_factor_ * position_delta;
+
+    // Apply orientation filtering with clamping
+    // Calculate angular difference between target and filtered orientation
+    Eigen::Quaterniond orientation_delta = filtered_orientation_target_.inverse() * imitation_orientation_target_;
+    
+    // Convert to axis-angle to check and limit the rotation
+    Eigen::AngleAxisd axis_angle(orientation_delta);
+    double rotation_angle = std::abs(axis_angle.angle());
+    
+    if (rotation_angle > max_orientation_delta_) {
+        // Scale down the rotation to maximum allowable
+        double scale_factor = max_orientation_delta_ / rotation_angle;
+        axis_angle.angle() = axis_angle.angle() * scale_factor;
+        orientation_delta = Eigen::Quaterniond(axis_angle);
+    }
+    
+    // Apply SLERP filtering for smooth orientation transitions
+    Eigen::Quaterniond intermediate_target = filtered_orientation_target_ * orientation_delta;
+    filtered_orientation_target_ = filtered_orientation_target_.slerp(imitation_orientation_filter_factor_, intermediate_target);
+    filtered_orientation_target_.normalize();
+
+    // Use the filtered targets for control
+    position_d_ = filtered_position_target_;
+    orientation_d_ = filtered_orientation_target_;
+    
+    // Calculate cartesian error (same as original Cartesian mode)
+    
+    // Position error
+    error.head(3) << position - position_d_;
+
+    // Orientation error
+    if (orientation_d_.coeffs().dot(orientation.coeffs()) < 0.0) {
+      orientation.coeffs() << -orientation.coeffs();
+    }
+    Eigen::Quaterniond error_quaternion(orientation.inverse() * orientation_d_);
+    error.tail(3) << error_quaternion.x(), error_quaternion.y(), error_quaternion.z();
+    error.tail(3) << -transform.rotation() * error.tail(3);
+    
+    // Calculate error integral for pose
+    I_error += Sm * dt * integrator_weights.cwiseProduct(error);
+    // Limit integral error to avoid windup
+    for (int i = 0; i < 6; i++){
+      I_error(i,0) = std::min(std::max(-max_I(i,0), I_error(i,0)), max_I(i,0)); 
+    }
+
+    // Calculate operational space inertia matrix
+    Lambda = (jacobian * M.inverse() * jacobian.transpose()).inverse();
+    
+    // Set Theta for impedance control
+    Theta = Lambda;
+
+    // Calculate critically damped damping matrix
+    D = D_gain * K.cwiseMax(0.0).cwiseSqrt() * Lambda.cwiseMax(0.0).diagonal().cwiseSqrt().asDiagonal();
+    // This creates a block diagonal structure [D_pos, 0; 0, D_rot], where D_pos and D_rot are 3x3 matrices for translational and rotational damping
+    D.topRightCorner(3,3).setZero();
+    D.bottomLeftCorner(3,3).setZero();
+    
+    // Calculate impedance force, negative sign: forces should pull towards the desired pose
+    F_impedance = -1 * (D * (jacobian * dq_) + K * error);
+
+    // Filter external force and calculate contact force error integral
+    F_ext = 0.9 * F_ext + 0.1 * O_F_ext_hat_K_M;
+    I_F_error += dt * Sf * (F_contact_des - F_ext);
+    F_cmd = Sf * (0.4 * (F_contact_des - F_ext) + 0.9 * I_F_error + 0.9 * F_contact_des);
+
+    // Calculate required torques
+    Eigen::VectorXd tau_task(7), tau_nullspace(7), tau_impedance(7);
+    pseudoInverse(jacobian.transpose(), jacobian_transpose_pinv);
+
+    // Nullspace component
+    tau_nullspace << (Eigen::MatrixXd::Identity(7, 7) -
+                      jacobian.transpose() * jacobian_transpose_pinv) *
+                      (nullspace_stiffness_ * config_control * (q_d_nullspace_ - q_) -
+                      (2.0 * sqrt(nullspace_stiffness_)) * dq_);
+
+    // Impedance and force control components
+    tau_impedance = jacobian.transpose() * Sm * F_impedance + jacobian.transpose() * Sf * F_cmd;
+    
+    // Combined desired torque with coriolis compensation -> Sent to the robot
+    tau_d = tau_impedance + tau_nullspace + coriolis;
+
+    // Debug output for imitation learning mode
+    if (outcounter % 100 == 0) {  // Log every 100 iterations
+        RCLCPP_INFO(get_node()->get_logger(), "\n==== Imitation Learning Mode (Filtered) ====");
+        
+        // Log RAW target pose
+        RCLCPP_INFO(get_node()->get_logger(), "RAW Target Position [m]: [%.3f, %.3f, %.3f]",
+                    imitation_position_target_.x(), imitation_position_target_.y(), imitation_position_target_.z());
+        RCLCPP_INFO(get_node()->get_logger(), "RAW Target Orientation [quat]: [%.3f, %.3f, %.3f, %.3f]",
+                    imitation_orientation_target_.w(), imitation_orientation_target_.x(), 
+                    imitation_orientation_target_.y(), imitation_orientation_target_.z());
+        
+        // Log FILTERED target pose
+        RCLCPP_INFO(get_node()->get_logger(), "Filtered Target Position [m]: [%.3f, %.3f, %.3f]",
+                    position_d_.x(), position_d_.y(), position_d_.z());
+        RCLCPP_INFO(get_node()->get_logger(), "Filtered Target Orientation [quat]: [%.3f, %.3f, %.3f, %.3f]",
+                    orientation_d_.w(), orientation_d_.x(), orientation_d_.y(), orientation_d_.z());
+        
+        // Log current pose
+        RCLCPP_INFO(get_node()->get_logger(), "Current Position [m]: [%.3f, %.3f, %.3f]",
+                    position.x(), position.y(), position.z());
+        RCLCPP_INFO(get_node()->get_logger(), "Current Orientation [quat]: [%.3f, %.3f, %.3f, %.3f]",
+                    orientation.w(), orientation.x(), orientation.y(), orientation.z());
+        
+        // Log pose error
+        RCLCPP_INFO(get_node()->get_logger(), "Position Error [m]: [%.3f, %.3f, %.3f]",
+                    error(0), error(1), error(2));
+        RCLCPP_INFO(get_node()->get_logger(), "Orientation Error [rad]: [%.3f, %.3f, %.3f]",
+                    error(3), error(4), error(5));
+
+        // Log computed torques
+        RCLCPP_INFO(get_node()->get_logger(), "Computed Torques [Nm]: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+                    tau_d(0), tau_d(1), tau_d(2), tau_d(3), tau_d(4), tau_d(5), tau_d(6));
+
+        RCLCPP_INFO(get_node()->get_logger(), "====================================================");
+    }
+  }
   // -------------------------------------------ORIGINAL CARTESIAN IMPEDANCE CONTROL MODE---------------------------------------------------------
   else {
     // Calculate cartesian error
