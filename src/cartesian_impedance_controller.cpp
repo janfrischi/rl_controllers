@@ -727,6 +727,7 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
         imitation_targets_initialized_ = true;
         RCLCPP_INFO(get_node()->get_logger(), "Initialized imitation learning targets from current pose");
     }
+    // ------------------------ Filtering and Clamping Logic for smooth control transitions ------------------------
 
     // Apply position filtering with clamping
     Eigen::Vector3d position_delta = imitation_position_target_ - filtered_position_target_;
@@ -763,9 +764,10 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
     // Use the filtered targets for control
     position_d_ = filtered_position_target_;
     orientation_d_ = filtered_orientation_target_;
+
+    // ------------------------------- Impedance Control Logic --------------------------------------------------------
     
     // Calculate cartesian error (same as original Cartesian mode)
-    
     // Position error
     error.head(3) << position - position_d_;
 
@@ -773,24 +775,21 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
     if (orientation_d_.coeffs().dot(orientation.coeffs()) < 0.0) {
       orientation.coeffs() << -orientation.coeffs();
     }
+    // q_e = q_d * q^-1
     Eigen::Quaterniond error_quaternion(orientation.inverse() * orientation_d_);
+    // Extract the xyz components of the quaternion error
     error.tail(3) << error_quaternion.x(), error_quaternion.y(), error_quaternion.z();
+    // This is the yaw-pitch-roll representation of the orientation error "angle-axis representation"
+    // transform.rotation() 3x3 is used to rotate the error vector to the base frame
     error.tail(3) << -transform.rotation() * error.tail(3);
     
-    // Calculate error integral for pose
-    I_error += Sm * dt * integrator_weights.cwiseProduct(error);
-    // Limit integral error to avoid windup
-    for (int i = 0; i < 6; i++){
-      I_error(i,0) = std::min(std::max(-max_I(i,0), I_error(i,0)), max_I(i,0)); 
-    }
-
-    // Calculate operational space inertia matrix
+    // Calculate operational space inertia matrix "Tranform joint space intertia M to cartesian space inertia Lambda"
     Lambda = (jacobian * M.inverse() * jacobian.transpose()).inverse();
     
-    // Set Theta for impedance control
+    // Set Theta for impedance control 
     Theta = Lambda;
 
-    // Calculate critically damped damping matrix
+    // Calculate critically damped damping matrix dynamically D_gain=2.4
     D = D_gain * K.cwiseMax(0.0).cwiseSqrt() * Lambda.cwiseMax(0.0).diagonal().cwiseSqrt().asDiagonal();
     // This creates a block diagonal structure [D_pos, 0; 0, D_rot], where D_pos and D_rot are 3x3 matrices for translational and rotational damping
     D.topRightCorner(3,3).setZero();
@@ -817,7 +816,7 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
     // Impedance and force control components
     tau_impedance = jacobian.transpose() * Sm * F_impedance + jacobian.transpose() * Sf * F_cmd;
     
-    // Combined desired torque with coriolis compensation -> Sent to the robot
+    // Final Torque calculation: Combine desired torque with coriolis compensation -> Sent to the robot
     tau_d = tau_impedance + tau_nullspace + coriolis;
 
     // Debug output for imitation learning mode
@@ -860,10 +859,10 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
   else {
     // Calculate cartesian error
 
-    // Position error
+    // Position error "error.head(3)" is the difference between current position and desired position
     error.head(3) << position - position_d_;
 
-    //Orientation error
+    //Orientation error - axis angle representation
     if (orientation_d_.coeffs().dot(orientation.coeffs()) < 0.0) {
       orientation.coeffs() << -orientation.coeffs();
     }
@@ -890,7 +889,7 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
     D.topRightCorner(3,3).setZero();
     D.bottomLeftCorner(3,3).setZero();
     
-    // Calculate impedance force, negative sign: forces should pull towards the desired pose
+    // Cartesian Impedance eq: Calculate impedance force, negative sign: forces should pull towards the desired pose
     F_impedance = -1 * (D * (jacobian * dq_) + K * error);
 
     // Filter external force and calculate contact force error integral
