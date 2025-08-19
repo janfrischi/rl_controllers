@@ -59,14 +59,15 @@ bool imitation_commands_received_ = false;
 Eigen::Vector3d imitation_position_target_{0.5, 0.0, 0.4};  // Default position
 Eigen::Quaterniond imitation_orientation_target_{1.0, 0.0, 0.0, 0.0};  // Default orientation
 rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr imitation_learning_subscription_ = nullptr;
+rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr jacobian_pub_;
 
+// Function to update the stiffness and references during the controller update
 void CartesianImpedanceController::update_stiffness_and_references(){
   //target by filtering
   /** at the moment we do not use dynamic reconfigure and control the robot via D, K and T **/
   //K = filter_params_ * cartesian_stiffness_target_ + (1.0 - filter_params_) * K;
   //D = filter_params_ * cartesian_damping_target_ + (1.0 - filter_params_) * D;
   nullspace_stiffness_ = filter_params_ * nullspace_stiffness_target_ + (1.0 - filter_params_) * nullspace_stiffness_;
-  //std::lock_guard<std::mutex> position_d_target_mutex_lock(position_and_orientation_d_target_mutex_);
   position_d_ = filter_params_ * position_d_target_ + (1.0 - filter_params_) * position_d_;
   orientation_d_ = orientation_d_.slerp(filter_params_, orientation_d_target_);
   F_contact_des = 0.05 * F_contact_target + 0.95 * F_contact_des;
@@ -155,20 +156,22 @@ CallbackReturn CartesianImpedanceController::on_init() {
 
 
 CallbackReturn CartesianImpedanceController::on_configure(const rclcpp_lifecycle::State& /*previous_state*/) {
-  // Ensure that the free_movement_mode can be set via launch file or dynamically via ros2 param set
+  // Set all modes to false by default on startup
   free_movement_mode_ = get_node()->declare_parameter<bool>("free_movement_mode", false);
   policy_control_mode_ = get_node()->declare_parameter<bool>("policy_control_mode", false);
   trajectory_playback_mode_ = get_node()->declare_parameter<bool>("trajectory_playback_mode", false);
-  // Declare a parameter to trigger the reset action
   reset_to_default_position_ = get_node()->declare_parameter<bool>("reset_to_default_position", false);
   imitation_learning_mode_ = get_node()->declare_parameter<bool>("imitation_learning_mode", false);
 
-  RCLCPP_INFO(get_node()->get_logger(), "Free movement mode parameter: %s", free_movement_mode_ ? "ON" : "OFF");
-  RCLCPP_INFO(get_node()->get_logger(), "Trajectory Playback Mode parameter: %s", trajectory_playback_mode_ ? "ON" : "OFF");
-  RCLCPP_INFO(get_node()->get_logger(), "Policy Control Mode parameter: %s", policy_control_mode_ ? "ON" : "OFF");
-  RCLCPP_INFO(get_node()->get_logger(), "Reset to Default Position parameter: %s", reset_to_default_position_ ? "ON" : "OFF");
-  RCLCPP_INFO(get_node()->get_logger(), "Imitation Learning Mode parameter: %s", imitation_learning_mode_ ? "ON" : "OFF");
+  // Force all modes to false on startup to ensure normal impedance control runs first
+  free_movement_mode_ = false;
+  policy_control_mode_ = false;
+  trajectory_playback_mode_ = false;
+  imitation_learning_mode_ = false;
+  reset_to_default_position_ = false;
 
+  RCLCPP_INFO(get_node()->get_logger(), "All control modes disabled on startup - robot will go to home position");
+  
   franka_robot_model_ = std::make_unique<franka_semantic_components::FrankaRobotModel>(
   franka_semantic_components::FrankaRobotModel(robot_name_ + "/" + k_robot_model_interface_name,
                                                robot_name_ + "/" + k_robot_state_interface_name));
@@ -186,6 +189,8 @@ CallbackReturn CartesianImpedanceController::on_configure(const rclcpp_lifecycle
     fprintf(stderr,  "Exception thrown during publisher creation at configure stage with message : %s \n",e.what());
     return CallbackReturn::ERROR;
   }
+
+  // -------------------------- Subscriptions --------------------------
 
   try {
     // Create subscription for policy outputs
@@ -253,6 +258,10 @@ CallbackReturn CartesianImpedanceController::on_configure(const rclcpp_lifecycle
     policy_control_mode_ = false;  // Disable policy control mode
   }
 
+  // Create publisher for Jacobian matrix
+  jacobian_pub_ = get_node()->create_publisher<std_msgs::msg::Float64MultiArray>(
+    "/franka/jacobian_ee", 10);
+
   RCLCPP_DEBUG(get_node()->get_logger(), "configured successfully");
   return CallbackReturn::SUCCESS;
 }
@@ -290,6 +299,8 @@ std::array<double, 6> CartesianImpedanceController::convertToStdArray(const geom
     result[5] = wrench.wrench.torque.z;
     return result;
 }
+
+// ------------------ Callbacks ------------------
 
 void CartesianImpedanceController::topic_callback(const std::shared_ptr<franka_msgs::msg::FrankaRobotState> msg) {
   O_F_ext_hat_K = convertToStdArray(msg->o_f_ext_hat_k);
@@ -372,6 +383,7 @@ void CartesianImpedanceController::imitation_learning_callback(
                      imitation_orientation_target_.y(), imitation_orientation_target_.z());
     }
 }
+
 void CartesianImpedanceController::updateJointStates() {
   for (auto i = 0; i < num_joints; ++i) {
     const auto& position_interface = state_interfaces_.at(2 * i);
@@ -385,7 +397,7 @@ void CartesianImpedanceController::updateJointStates() {
 }
 
 // The update function is called periodically by the controller manager
-// Each call of the update function corresponds to a control loop iteration
+// Each call of the update function corresponds to a control loop iteration, controller is running at 1000 Hz
 controller_interface::return_type CartesianImpedanceController::update(const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {  
 
   // Get the current value of the free_movement_mode parameter
@@ -422,13 +434,21 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
   Eigen::Vector3d position(transform.translation());
   Eigen::Quaterniond orientation(transform.rotation());
   
-  // Create rotation quaternion from euler angles
+  // Create rotation quaternion from euler angles -> This is important for the default mode of the controller
   orientation_d_target_ = Eigen::AngleAxisd(rotation_d_target_[0], Eigen::Vector3d::UnitX())
                         * Eigen::AngleAxisd(rotation_d_target_[1], Eigen::Vector3d::UnitY())
                         * Eigen::AngleAxisd(rotation_d_target_[2], Eigen::Vector3d::UnitZ());
   
   // Update joint states using the state interfaces
   updateJointStates();
+
+  // Publish the Jacobian
+  std_msgs::msg::Float64MultiArray jacobian_msg;
+  jacobian_msg.data.resize(42);
+  for (size_t i = 0; i < 42; ++i) {
+      jacobian_msg.data[i] = jacobian_array[i];
+  }
+  jacobian_pub_->publish(jacobian_msg);
 
   // Initialize torque vector
   Eigen::VectorXd tau_d(7);
@@ -617,7 +637,7 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
         }
     }
 }
-  // --------------------------------------------------POLICY CONTROL MODE-------------------------------------------------------------------------------
+  // --------------------------------------------------POLICY CONTROL MODE - RL Framework-------------------------------------------------------------------------------
   else if (policy_control_mode_) {
     
     // Define stiffness (kp) and damping (kd) gains
@@ -706,7 +726,7 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
     }
   } 
 
-  // --------------------------------------------------IMITATION LEARNING MODE-------------------------------------------------------------------------------
+  // --------------------------------------------------IMITATION LEARNING MODE - IL Framework-------------------------------------------------------------------------------
   else if (imitation_learning_mode_) {
     
     if (!imitation_commands_received_) {
@@ -729,45 +749,40 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
     }
     // ------------------------ Filtering and Clamping Logic for smooth control transitions ------------------------
 
-    // Apply position filtering with clamping
-    Eigen::Vector3d position_delta = imitation_position_target_ - filtered_position_target_;
-    
-    // Clamp position delta to maximum allowable change
-    double position_delta_norm = position_delta.norm();
-    if (position_delta_norm > max_position_delta_) {
-        position_delta = position_delta * (max_position_delta_ / position_delta_norm);
-    }
-    
-    // Apply exponential filtering to position
-    filtered_position_target_ += imitation_position_filter_factor_ * position_delta;
+    // Get raw targets from imitation learning commands
+    Eigen::Vector3d raw_position_target = imitation_position_target_;
+    Eigen::Quaterniond raw_orientation_target = imitation_orientation_target_;
 
-    // Apply orientation filtering with clamping
-    // Calculate angular difference between target and filtered orientation
-    Eigen::Quaterniond orientation_delta = filtered_orientation_target_.inverse() * imitation_orientation_target_;
-    
-    // Convert to axis-angle to check and limit the rotation
-    Eigen::AngleAxisd axis_angle(orientation_delta);
-    double rotation_angle = std::abs(axis_angle.angle());
-    
-    if (rotation_angle > max_orientation_delta_) {
-        // Scale down the rotation to maximum allowable
-        double scale_factor = max_orientation_delta_ / rotation_angle;
-        axis_angle.angle() = axis_angle.angle() * scale_factor;
-        orientation_delta = Eigen::Quaterniond(axis_angle);
+    // Apply orientation clamping to limit large rotations
+    Eigen::Quaterniond clamped_orientation_target = raw_orientation_target;
+    {
+        // Calculate angular difference between current filtered and raw target
+        Eigen::Quaterniond orientation_delta = orientation_d_.inverse() * raw_orientation_target;
+        
+        // Convert to axis-angle to check and limit the rotation
+        Eigen::AngleAxisd axis_angle(orientation_delta);
+        double rotation_angle = std::abs(axis_angle.angle());
+        
+        if (rotation_angle > max_orientation_delta_) {
+            // Scale down the rotation to maximum allowable
+            double scale_factor = max_orientation_delta_ / rotation_angle;
+            axis_angle.angle() = axis_angle.angle() * scale_factor;
+            
+            // Apply clamped rotation to current orientation
+            clamped_orientation_target = orientation_d_ * Eigen::Quaterniond(axis_angle);
+            clamped_orientation_target.normalize();
+        }
     }
-    
-    // Apply SLERP filtering for smooth orientation transitions
-    Eigen::Quaterniond intermediate_target = filtered_orientation_target_ * orientation_delta;
-    filtered_orientation_target_ = filtered_orientation_target_.slerp(imitation_orientation_filter_factor_, intermediate_target);
-    filtered_orientation_target_.normalize();
 
-    // Use the filtered targets for control
-    position_d_ = filtered_position_target_;
-    orientation_d_ = filtered_orientation_target_;
+    // Apply exponential moving average filter for position and slerp for orientation
+    position_d_ = (1.0 - imitation_position_filter_factor_) * position_d_ + 
+                  imitation_position_filter_factor_ * raw_position_target;
+
+    orientation_d_ = orientation_d_.slerp(imitation_orientation_filter_factor_, clamped_orientation_target);
 
     // ------------------------------- Impedance Control Logic --------------------------------------------------------
     
-    // Calculate cartesian error (same as original Cartesian mode)
+    // Calculate cartesian error
     // Position error
     error.head(3) << position - position_d_;
 
@@ -944,7 +959,15 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
   }
   
   outcounter++;
-  update_stiffness_and_references();
+  //update_stiffness_and_references();
+
+  // Simple print every N iterations to avoid spam
+  if (outcounter % 100 == 0) {
+      std::cout << "Jacobian Matrix:" << std::endl;
+      std::cout << jacobian << std::endl;
+      std::cout << "---" << std::endl;
+  }
+
   return controller_interface::return_type::OK;
 }
 } // namespace cartesian_impedance_control
