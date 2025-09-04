@@ -73,3 +73,44 @@ required new messages have to be defined.
 
 ### Custom messages
 In the messages_fr3 package, some messages are already defined. The message definition for the service can be found in meessages_fr3/srv. When creating a new message, first, the definition has to be created in .srv file in CamelCase. Then, type the request, together with the type of the variable, followed by three hyphens and the desired response. The last step, before the message can be included as a lowercase_lowerscase.hpp file is to add it to the CMakeLists.txt file below the already existing messages in the rosidl_generate_interface block.
+
+## Control Modes (Runtime Parameters)
+
+The controller ([`CartesianImpedanceController`](cartesian_impedance_control/include/cartesian_impedance_control/cartesian_impedance_controller.hpp)) exposes boolean parameters you can toggle at runtime (only ONE primary motion mode should be true at a time; internal logic enforces precedence):
+
+| Mode | Parameter | Purpose | Core Topic(s) |
+|------|-----------|---------|---------------|
+| Cartesian Impedance (default) | (all false) | Standard stiffness / damping pose control with impedance & force logic | Publishes Jacobian: `/franka/jacobian_ee` |
+| Free Movement Mode | `free_movement_mode` | Gravity + damping (low resistance), no pose attraction | — |
+| Policy Control Mode | `policy_control_mode` | Follows joint targets from learned RL policy | `/policy_outputs` (std_msgs/Float64MultiArray, 7 joints) |
+| Trajectory Playback Mode | `trajectory_playback_mode` | Plays externally supplied joint sequences | `/trajectory_playback/joint_positions` (Float64MultiArray, 7 joints) |
+| Reset To Default | `reset_to_default_position` | One‑shot filtered move back to nominal joint config (used in free mode) | Uses internal filtering (no topic) |
+| Imitation Learning Mode | `imitation_learning_mode` | Cartesian pose tracking from IL policy / teleop | `/cartesian_position_controller/commands` (Float64MultiArray: [x,y,z,qx,qy,qz,qw]) |
+
+Precedence (highest first): imitation_learning_mode > trajectory_playback_mode > policy_control_mode > free_movement_mode. Reset flag overlays free_movement_mode to return to default.
+
+### Enable / Disable Modes
+
+(Controller node name: `/cartesian_impedance_controller`)
+
+```bash
+# Inspect parameters
+ros2 param list /cartesian_impedance_controller
+
+# Enable free movement
+ros2 param set /cartesian_impedance_controller free_movement_mode true
+
+# Switch to policy control (first disable others)
+ros2 param set /cartesian_impedance_controller free_movement_mode false
+ros2 param set /cartesian_impedance_controller policy_control_mode true
+
+# Start trajectory playback
+ros2 param set /cartesian_impedance_controller policy_control_mode false
+ros2 param set /cartesian_impedance_controller trajectory_playback_mode true
+
+# Trigger reset (will auto-clear when finished)
+ros2 param set /cartesian_impedance_controller reset_to_default_position true
+
+# Enable imitation learning
+ros2 param set /cartesian_impedance_controller imitation_learning_mode true
+```
