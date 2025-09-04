@@ -47,52 +47,29 @@ Launch the client if you want to adjust parameters: <br />
 ros2 run cartesian_impedance_control user_input_client 
 ```
 
-You have multiple options: 
-1. Change target position of the end-effector (only works in mode 1 and not in free-float)
-2. Change impedance parameter
-3. Change mode (mode 1 = cartesian impedance control --> with a position / mode 2 = free-float with variable inertia)
-
-This section should give the reader a better understanding of how the controller
-works and what the functions are used for.
-### Controller
-After launching the controller the three startup functions on_init(), on_configure(), and on_activate() are being called before the controller starts. All these functions were taken over from the franka_example_controller package from Franka Emika and have been equipped with the required steps.
-#### Startup functions
-In on_init(), the constructor of the input server is called, and together with the references to the variables that need to be changed during runtime, an object of this class is created. Then, this object is multithreaded in order to make sure that the controller and server can run in parallel. During on_configure(), a FrankaRobotModel object is assigned robot parameters, over which some of the states from the robot can be read. Then, the controller subscribes to the franka_forbot_state_broadcaster, using a reliable quality of service setting. If this setting would not be specified, it might happen, that the robot does not receive the states in the beginning and has an undefined behaviour. After that, the collision behavior is assigned to the robot. For that, a client is created and a request is sent to the robot to change the collision behavior to what is specified. When on_activate() is called, the franka_robot_model_ variable is assigned its states, which have been before declared in the state_interface_configuration(). Then the initial states are assigned and mapped to the respective variables. Next to the StateInterface, also a so-called CommandInterface is created before the controller starts. This interface is later used to send the desired torques to the robot.
-#### Update()
-The update() function is where the controller itself is running. At the start, the robot states are again read and mapped to the respective variables. Then the rotation quaternion is created given the desired Euler angles. When changing these angles, attention has to be paid as the standard position (gripper pointing downwards and the flat part of the end-effector pointing in x-direction), has the Euler angles (PI, 0, 0). The next step is to get the position and velocity of all the joints, using the StateInterface. Then the pseudo-inverse of the Jacobian is created using the pseudoinverse() function, the error terms are alculated and the inertia of the robot is calculated. To improve the robot's behavior, the external force is smoothened using an exponential filter. The smoothing factor of choice is equal to 0.1. For increased precision, the controller uses friction compensation as described in Luba 2024. The integrator in there makes the robot push the interactor away when not at the desired position and for that, a Boolean is introduced which empties the integrator as soon as the robot has an external force of more than 10N. In the switch statement, the controller checks whether free-float or impedance control is used. If mode_ = 1, the controller uses impedance control. If mode_ = 2, the free-float is chosen. Then the nullspace torque is calculated, the impedance force is converted into joint torques, and the desired torque, which is the sum of impedance, nullspace, Coriolis, and friction torques is calculated. This result is saturated, to limit the torque ramp. For this project, a torque ramp of 100 Nm/s was used. This saturated torque is then commanded to the robot using the command interface. After that, the position and orientation intermediate steps are updated, which also use an exponential filter. At the very end of the update() function, a condition with variable terminal output frequency for debugging purposes is defined. This update loop is running at 1000 Hz and is only interrupted through robot errors and manual shutting down of the controller. At the very end, the on_deactivate() is called where the franka_robot_model_ states are released. 
-
-### Input service
-The service consists of a server and a client. Each of those subsystems has its own .cpp and .hpp file, called user_input_client.cpp, user_input_client.hpp, user_input_server.cpp and user_input_client.hpp respectively. The client has to be called in a second terminal, while the server is automatically launched when launching the controller.
-
-#### Input server
-The input server consists of a main function and one callback function per client. At first, the node is created, and then one server per changeable parameter. As of now, the pose, impedance parameter and mode have an own server. As soon as a client with the same service name is called, a callback function is executed, where the sent request is assigned to the parameter running on the controller. 
-
-#### Input client
-The input client consists of one main function only. At first rclcpp::init(argc,argv) is called to initialize communication. Then, the node on which all different clients are created on. After that, a request for all the different parameters one wants to change. Next, using a std::cin statement, the desired parameters to change are read in by the program, assigned to the respective parts of the request, the request is sent and the node spined until a successful response is received. When the server is stopped, the node is shut down. If it is desired to change a new parameter, this first needs to be given into the constructor of the UserInputServer so that the correct parameter can be changed during runtime. Then a client and a server have to be implemented in the same way as already inside the respective files. In addition to that, if
-required new messages have to be defined.
-
-### Custom messages
-In the messages_fr3 package, some messages are already defined. The message definition for the service can be found in meessages_fr3/srv. When creating a new message, first, the definition has to be created in .srv file in CamelCase. Then, type the request, together with the type of the variable, followed by three hyphens and the desired response. The last step, before the message can be included as a lowercase_lowerscase.hpp file is to add it to the CMakeLists.txt file below the already existing messages in the rosidl_generate_interface block.
-
 ## Control Modes (Runtime Parameters)
 
-The controller ([`CartesianImpedanceController`](cartesian_impedance_control/include/cartesian_impedance_control/cartesian_impedance_controller.hpp)) exposes boolean parameters you can toggle at runtime (only ONE primary motion mode should be true at a time; internal logic enforces precedence):
+Launch the Cartesian Impedance Controller (must be active before toggling any mode):
+```bash
+ros2 launch cartesian_impedance_control cartesian_impedance_controller.launch.py
+```
+
+The controller (`CartesianImpedanceController`) exposes boolean parameters you can toggle at runtime (only ONE primary motion mode should be true at a time; internal logic enforces precedence):
 
 | Mode | Parameter | Purpose | Core Topic(s) |
 |------|-----------|---------|---------------|
-| Cartesian Impedance (default) | (all false) | Standard stiffness / damping pose control with impedance & force logic | Publishes Jacobian: `/franka/jacobian_ee` |
+| Cartesian Impedance (default) | (all false) | Standard stiffness / damping pose control (impedance + force logic) | `/franka/jacobian_ee` |
 | Free Movement Mode | `free_movement_mode` | Gravity + damping (low resistance), no pose attraction | — |
-| Policy Control Mode | `policy_control_mode` | Follows joint targets from learned RL policy | `/policy_outputs` (std_msgs/Float64MultiArray, 7 joints) |
-| Trajectory Playback Mode | `trajectory_playback_mode` | Plays externally supplied joint sequences | `/trajectory_playback/joint_positions` (Float64MultiArray, 7 joints) |
-| Reset To Default | `reset_to_default_position` | One‑shot filtered move back to nominal joint config (used in free mode) | Uses internal filtering (no topic) |
-| Imitation Learning Mode | `imitation_learning_mode` | Cartesian pose tracking from IL policy / teleop | `/cartesian_position_controller/commands` (Float64MultiArray: [x,y,z,qx,qy,qz,qw]) |
+| Policy Control Mode | `policy_control_mode` | Follows joint targets from learned RL / BC policy | `/policy_outputs` (Float64MultiArray, 7) |
+| Trajectory Playback Mode | `trajectory_playback_mode` | Plays externally supplied joint sequences | `/trajectory_playback/joint_positions` |
+| Reset To Default | `reset_to_default_position` | One‑shot filtered move back to nominal joint config | (internal) |
+| Imitation Learning Mode | `imitation_learning_mode` | Cartesian pose tracking from IL policy / teleop | `/cartesian_position_controller/commands` (Float64MultiArray: 7) |
 
-Precedence (highest first): imitation_learning_mode > trajectory_playback_mode > policy_control_mode > free_movement_mode. Reset flag overlays free_movement_mode to return to default.
+Precedence (highest first): imitation_learning_mode > trajectory_playback_mode > policy_control_mode > free_movement_mode. `reset_to_default_position` overlays free mode.
 
 ### Enable / Disable Modes
 
-(Controller node name: `/cartesian_impedance_controller`)
-
+(Controller node: `/cartesian_impedance_controller`)
 ```bash
 # Inspect parameters
 ros2 param list /cartesian_impedance_controller
@@ -100,7 +77,7 @@ ros2 param list /cartesian_impedance_controller
 # Enable free movement
 ros2 param set /cartesian_impedance_controller free_movement_mode true
 
-# Switch to policy control (first disable others)
+# Switch to policy control
 ros2 param set /cartesian_impedance_controller free_movement_mode false
 ros2 param set /cartesian_impedance_controller policy_control_mode true
 
@@ -108,7 +85,7 @@ ros2 param set /cartesian_impedance_controller policy_control_mode true
 ros2 param set /cartesian_impedance_controller policy_control_mode false
 ros2 param set /cartesian_impedance_controller trajectory_playback_mode true
 
-# Trigger reset (will auto-clear when finished)
+# Trigger reset (auto-clears)
 ros2 param set /cartesian_impedance_controller reset_to_default_position true
 
 # Enable imitation learning
